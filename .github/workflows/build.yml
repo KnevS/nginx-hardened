@@ -44,11 +44,11 @@ jobs:
 
       - name: Funktionstest
         run: |
-          docker run -d --name t -p 8080:80 nginx-hardened:test
+          docker run -d --name nginx-test -p 8080:80 nginx-hardened:test
           for i in $(seq 1 20); do curl -fsS -o /dev/null http://127.0.0.1:8080/ && break; sleep 1; done
           curl -fsS http://127.0.0.1:8080/ | grep -qi "nginx"
-          docker exec t nginx -t
-          docker rm -f t
+          docker exec nginx-test nginx -t
+          docker rm -f nginx-test
 
       - name: Trivy-Vergleich gegen :stable
         id: scan
