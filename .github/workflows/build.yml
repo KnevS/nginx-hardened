@@ -1,0 +1,133 @@
+name: Build
+
+# Täglicher Neubau: holt neue Alpine-Pakete, prüft mit Trivy und
+# veröffentlicht nur, wenn sich der Paketstand gegenüber :stable geändert hat
+# und das neue Image nicht mehr behebbare HIGH/CRITICAL enthält als das alte.
+# Ohne Änderung bleibt :stable unangetastet, Watchtower startet also nicht
+# jede Nacht alle nginx-Container neu.
+#
+# Zeitplan: 23:05 UTC, also vor dem Watchtower-Lauf (03:00 Europe/Berlin).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "5 23 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Auch ohne Paketänderung veröffentlichen"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/knevs/nginx-hardened
+  # Gepinnt wie auf dem Server (cve-scan.sh); trivy-action bewusst nicht genutzt.
+  TRIVY: aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Image bauen (lokal, ohne Cache)
+        run: docker build --pull --no-cache -t nginx-hardened:test .
+
+      - name: Funktionstest
+        run: |
+          docker run -d --name t -p 8080:80 nginx-hardened:test
+          for i in $(seq 1 20); do curl -fsS -o /dev/null http://127.0.0.1:8080/ && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8080/ | grep -qi "nginx"
+          docker exec t nginx -t
+          docker rm -f t
+
+      - name: Trivy-Vergleich gegen :stable
+        id: scan
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/trivy"
+          count() {
+            docker save "$1" > "$RUNNER_TEMP/trivy/img.tar"
+            docker run --rm -v "$RUNNER_TEMP/trivy:/w" "$TRIVY" image \
+              --input /w/img.tar --scanners vuln --severity HIGH,CRITICAL \
+              --ignore-unfixed --no-progress --quiet --format json \
+              | jq '[.Results[]?.Vulnerabilities[]?] | length'
+          }
+          pkgs() { docker run --rm --entrypoint apk "$1" list -I | sort | sha256sum | cut -c1-16; }
+
+          if docker pull -q "$IMAGE:stable" >/dev/null 2>&1; then
+            old=$(count "$IMAGE:stable"); pkgs_old=$(pkgs "$IMAGE:stable")
+          else
+            old=999999; pkgs_old=none
+          fi
+          # Kandidat zuletzt, damit img.tar danach den Kandidaten enthält.
+          new=$(count nginx-hardened:test); pkgs_new=$(pkgs nginx-hardened:test)
+
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          echo "old=$old" >> "$GITHUB_OUTPUT"
+          echo "changed=$([ "$pkgs_new" != "$pkgs_old" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          {
+            echo "| | :stable | Kandidat |"
+            echo "|---|---|---|"
+            echo "| behebbare HIGH/CRIT | $old | $new |"
+            echo "| Paketstand | \`$pkgs_old\` | \`$pkgs_new\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Restfunde im Log (öffentliches Image, die Funde sind kein Geheimnis).
+          docker run --rm -v "$RUNNER_TEMP/trivy:/w" "$TRIVY" image \
+            --input /w/img.tar --scanners vuln --severity HIGH,CRITICAL \
+            --ignore-unfixed --no-progress --quiet || true
+
+      - name: Entscheidung
+        id: d
+        env:
+          FORCE: ${{ inputs.force || false }}
+          CHANGED: ${{ steps.scan.outputs.changed }}
+          NEW: ${{ steps.scan.outputs.new }}
+          OLD: ${{ steps.scan.outputs.old }}
+        run: |
+          publish=false
+          if [ "$NEW" -gt "$OLD" ]; then
+            echo "::error::Kandidat hat mehr behebbare Funde ($NEW) als :stable ($OLD) – nicht veröffentlicht."
+            exit 1
+          elif [ "$CHANGED" = "true" ] || [ "$FORCE" = "true" ]; then
+            publish=true
+          else
+            echo "::notice::Paketstand unverändert – :stable bleibt."
+          fi
+          if [ "$NEW" -gt 0 ]; then
+            echo "::warning::$NEW behebbare HIGH/CRITICAL ohne Alpine-Paket – kommen mit dem nächsten Upstream-Fix."
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "nginx=$(docker run --rm --entrypoint nginx nginx-hardened:test -v 2>&1 | sed 's|.*/||')" >> "$GITHUB_OUTPUT"
+
+      - name: Bei GHCR anmelden
+        if: github.event_name != 'pull_request' && steps.d.outputs.publish == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Veröffentlicht wird genau das geprüfte lokale Image – kein zweiter
+      # Build, der inzwischen andere Pakete ziehen könnte.
+      - name: Veröffentlichen
+        if: github.event_name != 'pull_request' && steps.d.outputs.publish == 'true'
+        env:
+          V: ${{ steps.d.outputs.nginx }}-${{ steps.d.outputs.date }}
+        run: |
+          for t in stable "$V" "sha-$GITHUB_SHA"; do
+            docker tag nginx-hardened:test "$IMAGE:$t"
+            docker push -q "$IMAGE:$t"
+          done
+          echo "Veröffentlicht: \`$IMAGE:stable\` ($V)" >> "$GITHUB_STEP_SUMMARY"

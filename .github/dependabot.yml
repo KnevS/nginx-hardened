@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # Gepinnte Actions-SHAs
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
